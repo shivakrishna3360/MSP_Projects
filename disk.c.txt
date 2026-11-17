@@ -1,0 +1,148 @@
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <fat_driver/diskio.h>
+#include <ti/devices/msp432e4/driverlib/flash.h>
+
+#define FLASH_FS_BASE_ADDR     0x000C0000UL        /* Base address of last 256KB */
+#define FLASH_FS_TOTAL_SIZE    (256UL * 1024UL)    /* 256 KB volume */
+#define FLASH_SECTOR_SIZE      512UL               /* FatFs minimum supported sector size */
+#define FLASH_ERASE_BLOCK_SIZE 16384UL             /* MSP432E4 hardware erase block (16 KB) */
+#define FLASH_SECTOR_COUNT     (FLASH_FS_TOTAL_SIZE / FLASH_SECTOR_SIZE)
+
+/* 4-byte aligned 16 KB RAM bounce buffer */
+static uint32_t s_blockBuffer[FLASH_ERASE_BLOCK_SIZE / sizeof(uint32_t)];
+
+/* Helper: Program only non-0xFFFFFFFF words to save flash controller cycles */
+static void FlashProgramFast(const uint32_t *src, uint32_t destAddr, uint32_t byteCount)
+{
+    uint32_t wordCount = byteCount / 4U;
+    uint32_t i = 0;
+
+    while (i < wordCount) {
+        /* Skip words that remain erased (0xFFFFFFFF) */
+        while (i < wordCount && src[i] == 0xFFFFFFFFUL) {
+            i++;
+        }
+        uint32_t runStart = i;
+        while (i < wordCount && src[i] != 0xFFFFFFFFUL) {
+            i++;
+        }
+        uint32_t runWords = i - runStart;
+        if (runWords > 0U) {
+            FlashProgram((uint32_t *)&src[runStart],
+                         destAddr + (runStart * 4U),
+                         runWords * 4U);
+        }
+    }
+}
+
+DSTATUS disk_initialize(BYTE pdrv)
+{
+    return (pdrv == 0) ? 0 : STA_NOINIT;
+}
+
+DSTATUS disk_status(BYTE pdrv)
+{
+    return (pdrv == 0) ? 0 : STA_NOINIT;
+}
+
+DRESULT disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
+{
+    if (pdrv != 0 || (sector + count) > FLASH_SECTOR_COUNT) {
+        return RES_PARERR;
+    }
+
+    uint32_t srcAddr = FLASH_FS_BASE_ADDR + (sector * FLASH_SECTOR_SIZE);
+    memcpy(buff, (const void *)srcAddr, count * FLASH_SECTOR_SIZE);
+
+    return RES_OK;
+}
+
+DRESULT disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
+{
+    if (pdrv != 0 || (sector + count) > FLASH_SECTOR_COUNT) {
+        return RES_PARERR;
+    }
+
+    uint32_t currentSector = sector;
+    uint32_t remainingSectors = count;
+    const uint8_t *srcPtr = buff;
+
+    while (remainingSectors > 0U) {
+        uint32_t sectorByteOffset = currentSector * FLASH_SECTOR_SIZE;
+        uint32_t blockBaseOffset  = sectorByteOffset & ~(FLASH_ERASE_BLOCK_SIZE - 1U);
+        uint32_t offsetInBlock    = sectorByteOffset - blockBaseOffset;
+        uint32_t blockPhysAddr    = FLASH_FS_BASE_ADDR + blockBaseOffset;
+
+        /* Calculate how many sectors in this request fall into the SAME 16 KB block */
+        uint32_t maxBytesInThisBlock = FLASH_ERASE_BLOCK_SIZE - offsetInBlock;
+        uint32_t maxSectorsInBlock   = maxBytesInThisBlock / FLASH_SECTOR_SIZE;
+        uint32_t sectorsToWrite      = (remainingSectors < maxSectorsInBlock)
+                                       ? remainingSectors
+                                       : maxSectorsInBlock;
+        uint32_t bytesToWrite        = sectorsToWrite * FLASH_SECTOR_SIZE;
+
+        /* Check if target flash can be written without erasing (only 1 -> 0 bit changes) */
+        bool needsErase = false;
+        bool isIdentical = true;
+        const uint8_t *flashBytePtr = (const uint8_t *)(blockPhysAddr + offsetInBlock);
+
+        for (uint32_t b = 0; b < bytesToWrite; b++) {
+            uint8_t oldVal = flashBytePtr[b];
+            uint8_t newVal = srcPtr[b];
+            if (oldVal != newVal) {
+                isIdentical = false;
+            }
+            if ((oldVal & newVal) != newVal) {
+                needsErase = true;
+                break;
+            }
+        }
+
+        if (!isIdentical) {
+            if (!needsErase) {
+                /* Fast path: Target area is already 0xFF (or only clearing bits).
+                 * Copy only the modified slice to aligned buffer and program directly. */
+                memcpy(s_blockBuffer, srcPtr, bytesToWrite);
+                FlashProgramFast(s_blockBuffer, blockPhysAddr + offsetInBlock, bytesToWrite);
+            } else {
+                /* Slow path: Must erase 16 KB block, batched once for all sectors in block */
+                memcpy(s_blockBuffer, (const void *)blockPhysAddr, FLASH_ERASE_BLOCK_SIZE);
+                memcpy(((uint8_t *)s_blockBuffer) + offsetInBlock, srcPtr, bytesToWrite);
+
+                FlashErase(blockPhysAddr);
+                FlashProgramFast(s_blockBuffer, blockPhysAddr, FLASH_ERASE_BLOCK_SIZE);
+            }
+        }
+
+        currentSector    += sectorsToWrite;
+        remainingSectors -= sectorsToWrite;
+        srcPtr           += bytesToWrite;
+    }
+
+    return RES_OK;
+}
+
+DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff)
+{
+    if (pdrv != 0) {
+        return RES_PARERR;
+    }
+
+    switch (cmd) {
+        case CTRL_SYNC:
+            return RES_OK;
+        case GET_SECTOR_COUNT:
+            *(DWORD *)buff = FLASH_SECTOR_COUNT;
+            return RES_OK;
+        case GET_SECTOR_SIZE:
+            *(WORD *)buff = FLASH_SECTOR_SIZE;
+            return RES_OK;
+        case GET_BLOCK_SIZE:
+            *(DWORD *)buff = FLASH_ERASE_BLOCK_SIZE / FLASH_SECTOR_SIZE;
+            return RES_OK;
+        default:
+            return RES_PARERR;
+    }
+}

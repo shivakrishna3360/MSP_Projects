@@ -1,0 +1,265 @@
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <fat_driver/diskio.h>
+#include <ti/devices/msp432e4/inc/hw_flash.h>
+#include <ti/devices/msp432e4/inc/hw_memmap.h>
+#include <ti/devices/msp432e4/inc/hw_types.h>
+#include <ti/devices/msp432e4/driverlib/flash.h>
+#include <ti/devices/msp432e4/driverlib/interrupt.h>
+
+#define FLASH_FS_BASE_ADDR      0x000C0000UL        /* Base address of last 256KB */
+#define FLASH_FS_TOTAL_SIZE     (256UL * 1024UL)    /* 256 KB volume */
+#define FLASH_SECTOR_SIZE       256UL               /* 256-byte logical sectors */
+#define FLASH_ERASE_BLOCK_SIZE  16384UL             /* MSP432E4 hardware erase block (16 KB) */
+#define FLASH_SECTOR_COUNT      (FLASH_FS_TOTAL_SIZE / FLASH_SECTOR_SIZE)
+#define INVALID_BLOCK_ADDR      0xFFFFFFFFUL
+
+/* 4-byte aligned 16 KB Write-Back RAM Cache */
+static uint32_t s_blockCache[FLASH_ERASE_BLOCK_SIZE / sizeof(uint32_t)] __attribute__((aligned(4)));
+static uint32_t s_cachedBlockAddr = INVALID_BLOCK_ADDR;
+static bool     s_cacheDirty      = false;
+static bool     s_blockIsErased   = false;
+static uint32_t s_dirtyStart      = FLASH_ERASE_BLOCK_SIZE;
+static uint32_t s_dirtyEnd        = 0;
+
+/* Direct Hardware 32-Word (128-Byte) Write-Buffer Programmer */
+static void FlashProgramWriteBuffer(const uint32_t *srcWords, uint32_t destAddr, uint32_t byteCount)
+{
+    uint32_t endAddr = destAddr + byteCount;
+    bool intsDisabled = IntMasterDisable();
+
+    while (destAddr < endAddr) {
+        /* 128-byte aligned hardware write-buffer page */
+        uint32_t pageBase  = destAddr & ~0x7FUL;
+        uint32_t wordStart = (destAddr - pageBase) >> 2;
+        uint32_t wordsLeft = (endAddr - destAddr) >> 2;
+        uint32_t wordCount = (wordsLeft > (32U - wordStart)) ? (32U - wordStart) : wordsLeft;
+
+        bool hasData = false;
+        volatile uint32_t *fwb = (volatile uint32_t *)(FLASH_CTRL_BASE + FLASH_O_FWBN);
+
+        /* Load up to 32 words into hardware Write Buffer registers */
+        for (uint32_t i = 0; i < wordCount; i++) {
+            uint32_t w = srcWords[i];
+            fwb[wordStart + i] = w;
+            if (w != 0xFFFFFFFFUL) {
+                hasData = true;
+            }
+        }
+
+        /* Trigger single 128-byte parallel hardware write only if non-0xFF data exists */
+        if (hasData) {
+            HWREG(FLASH_CTRL_BASE + FLASH_O_FMA)  = pageBase;
+            HWREG(FLASH_CTRL_BASE + FLASH_O_FMC2) = FLASH_FMC2_WRKEY | FLASH_FMC2_WRBUF;
+            while (HWREG(FLASH_CTRL_BASE + FLASH_O_FMC2) & FLASH_FMC2_WRBUF) {
+                /* Wait for hardware write buffer commit */
+            }
+        }
+
+        destAddr += (wordCount << 2);
+        srcWords += wordCount;
+    }
+
+    if (!intsDisabled) {
+        IntMasterEnable();
+    }
+}
+
+/* Flush dirty 16 KB RAM cache to physical Flash */
+static DRESULT FlushBlockCache(void)
+{
+    if (!s_cacheDirty || s_cachedBlockAddr == INVALID_BLOCK_ADDR) {
+        return RES_OK;
+    }
+
+    /* Align dirty range to 4-byte word boundaries */
+    uint32_t startByte = s_dirtyStart & ~3U;
+    uint32_t endByte   = (s_dirtyEnd + 3U) & ~3U;
+
+    if (s_blockIsErased) {
+        /* Ultra-fast path: Block was already 0xFF when loaded — skip comparison & erase */
+        FlashProgramWriteBuffer(&s_blockCache[startByte >> 2],
+                                s_cachedBlockAddr + startByte,
+                                endByte - startByte);
+    } else {
+        const uint32_t *flashWords = (const uint32_t *)s_cachedBlockAddr;
+        uint32_t startWord = startByte >> 2;
+        uint32_t endWord   = endByte >> 2;
+
+        bool needsErase  = false;
+        bool isIdentical = true;
+
+        for (uint32_t w = startWord; w < endWord; w++) {
+            uint32_t oldW = flashWords[w];
+            uint32_t newW = s_blockCache[w];
+            if (oldW != newW) {
+                isIdentical = false;
+                if ((oldW & newW) != newW) {
+                    needsErase = true;
+                    break;
+                }
+            }
+        }
+
+        if (!isIdentical) {
+            if (!needsErase) {
+                /* Fast path: Only 1 -> 0 bit transitions needed */
+                FlashProgramWriteBuffer(&s_blockCache[startWord],
+                                        s_cachedBlockAddr + startByte,
+                                        endByte - startByte);
+            } else {
+                /* Slow path: Single 16 KB erase + 128-byte parallel write buffer flush */
+                if (FlashErase(s_cachedBlockAddr) != 0) {
+                    return RES_ERROR;
+                }
+                FlashProgramWriteBuffer(s_blockCache, s_cachedBlockAddr, FLASH_ERASE_BLOCK_SIZE);
+                s_blockIsErased = true;
+            }
+        }
+    }
+
+    s_cacheDirty = false;
+    s_dirtyStart = FLASH_ERASE_BLOCK_SIZE;
+    s_dirtyEnd   = 0;
+    return RES_OK;
+}
+
+DSTATUS disk_initialize(BYTE pdrv)
+{
+    if (pdrv != 0) {
+        return STA_NOINIT;
+    }
+    s_cachedBlockAddr = INVALID_BLOCK_ADDR;
+    s_cacheDirty      = false;
+    s_blockIsErased   = false;
+    return 0;
+}
+
+DSTATUS disk_status(BYTE pdrv)
+{
+    return (pdrv == 0) ? 0 : STA_NOINIT;
+}
+
+DRESULT disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
+{
+    if (pdrv != 0 || (sector + count) > FLASH_SECTOR_COUNT) {
+        return RES_PARERR;
+    }
+
+    uint32_t currentSector    = sector;
+    uint32_t remainingSectors = count;
+    uint8_t *dstPtr           = buff;
+
+    while (remainingSectors > 0U) {
+        uint32_t sectorByteOffset = currentSector * FLASH_SECTOR_SIZE;
+        uint32_t blockBaseOffset  = sectorByteOffset & ~(FLASH_ERASE_BLOCK_SIZE - 1U);
+        uint32_t offsetInBlock    = sectorByteOffset - blockBaseOffset;
+        uint32_t blockPhysAddr    = FLASH_FS_BASE_ADDR + blockBaseOffset;
+
+        uint32_t maxSectorsInBlock = (FLASH_ERASE_BLOCK_SIZE - offsetInBlock) / FLASH_SECTOR_SIZE;
+        uint32_t sectorsToRead     = (remainingSectors < maxSectorsInBlock)
+                                     ? remainingSectors
+                                     : maxSectorsInBlock;
+        uint32_t bytesToRead       = sectorsToRead * FLASH_SECTOR_SIZE;
+
+        /* Serve directly from RAM cache if hit — ZERO Flash flush needed during reads! */
+        if (blockPhysAddr == s_cachedBlockAddr) {
+            memcpy(dstPtr, ((const uint8_t *)s_blockCache) + offsetInBlock, bytesToRead);
+        } else {
+            memcpy(dstPtr, (const void *)(blockPhysAddr + offsetInBlock), bytesToRead);
+        }
+
+        currentSector    += sectorsToRead;
+        remainingSectors -= sectorsToRead;
+        dstPtr           += bytesToRead;
+    }
+
+    return RES_OK;
+}
+
+DRESULT disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
+{
+    if (pdrv != 0 || (sector + count) > FLASH_SECTOR_COUNT) {
+        return RES_PARERR;
+    }
+
+    uint32_t currentSector    = sector;
+    uint32_t remainingSectors = count;
+    const uint8_t *srcPtr     = buff;
+
+    while (remainingSectors > 0U) {
+        uint32_t sectorByteOffset = currentSector * FLASH_SECTOR_SIZE;
+        uint32_t blockBaseOffset  = sectorByteOffset & ~(FLASH_ERASE_BLOCK_SIZE - 1U);
+        uint32_t offsetInBlock    = sectorByteOffset - blockBaseOffset;
+        uint32_t blockPhysAddr    = FLASH_FS_BASE_ADDR + blockBaseOffset;
+
+        /* Load new 16 KB block into cache only when crossing a 16 KB boundary */
+        if (s_cachedBlockAddr != blockPhysAddr) {
+            if (FlushBlockCache() != RES_OK) {
+                return RES_ERROR;
+            }
+            const uint32_t *flashWords = (const uint32_t *)blockPhysAddr;
+            uint32_t andAll = 0xFFFFFFFFUL;
+
+            /* Copy to RAM and check if entire 16 KB block is already blank (0xFF) in one pass */
+            for (uint32_t w = 0; w < (FLASH_ERASE_BLOCK_SIZE >> 2); w++) {
+                uint32_t val = flashWords[w];
+                s_blockCache[w] = val;
+                andAll &= val;
+            }
+
+            s_cachedBlockAddr = blockPhysAddr;
+            s_blockIsErased   = (andAll == 0xFFFFFFFFUL);
+            s_cacheDirty      = false;
+            s_dirtyStart      = FLASH_ERASE_BLOCK_SIZE;
+            s_dirtyEnd        = 0;
+        }
+
+        uint32_t maxSectorsInBlock = (FLASH_ERASE_BLOCK_SIZE - offsetInBlock) / FLASH_SECTOR_SIZE;
+        uint32_t sectorsToWrite    = (remainingSectors < maxSectorsInBlock)
+                                     ? remainingSectors
+                                     : maxSectorsInBlock;
+        uint32_t bytesToWrite      = sectorsToWrite * FLASH_SECTOR_SIZE;
+
+        /* Copy directly into cached block */
+        memcpy(((uint8_t *)s_blockCache) + offsetInBlock, srcPtr, bytesToWrite);
+        s_cacheDirty = true;
+
+        if (offsetInBlock < s_dirtyStart) {
+            s_dirtyStart = offsetInBlock;
+        }
+        if ((offsetInBlock + bytesToWrite) > s_dirtyEnd) {
+            s_dirtyEnd = offsetInBlock + bytesToWrite;
+        }
+
+        currentSector    += sectorsToWrite;
+        remainingSectors -= sectorsToWrite;
+        srcPtr           += bytesToWrite;
+    }
+
+    return RES_OK;
+}
+
+DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff)
+{
+    if (pdrv != 0) {
+        return RES_PARERR;
+    }
+
+    switch (cmd) {
+        case CTRL_SYNC:
+            return FlushBlockCache();
+        case GET_SECTOR_COUNT:
+            *(DWORD *)buff = FLASH_SECTOR_COUNT;
+            return RES_OK;
+        case GET_SECTOR_SIZE:
+            *(WORD *)buff = FLASH_SECTOR_SIZE;
+            return RES_OK;
+        case GET_BLOCK_SIZE:
+            *(DWORD *)buff = FLASH_ERASE_BLOCK_SIZE / FLASH_SECTOR_SIZE;
+            return RES_OK;
+        default:
+            return RES_PARERR;
+    }
+}
