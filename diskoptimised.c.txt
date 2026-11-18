@@ -1,0 +1,156 @@
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <fat_driver/diskio.h>
+#include <ti/devices/msp432e4/driverlib/flash.h>
+
+#define FLASH_FS_BASE_ADDR     0x000C0000UL        /* Base address of last 256KB */
+#define FLASH_FS_TOTAL_SIZE    (256UL * 1024UL)    /* 256 KB volume */
+#define FLASH_SECTOR_SIZE      512UL               /* Standard FatFs sector size */
+#define FLASH_ERASE_BLOCK_SIZE 16384UL             /* MSP432E4 hardware erase block (16 KB) */
+#define FLASH_SECTOR_COUNT     (FLASH_FS_TOTAL_SIZE / FLASH_SECTOR_SIZE) /* 512 sectors */
+
+/* 16 KB RAM bounce buffer for block read-modify-write operations */
+static uint32_t s_blockBuffer[FLASH_ERASE_BLOCK_SIZE / 4];
+
+
+DSTATUS disk_initialize(BYTE pdrv)
+{
+    if (pdrv != 0) {
+        return STA_NOINIT;
+    }
+    return 0;
+}
+
+DSTATUS disk_status(BYTE pdrv)
+{
+    if (pdrv != 0) {
+        return STA_NOINIT;
+    }
+    return 0;
+}
+
+DRESULT disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
+{
+    if (pdrv != 0 || (sector + count) > FLASH_SECTOR_COUNT) {
+        return RES_PARERR;
+    }
+
+    uint32_t srcAddr = FLASH_FS_BASE_ADDR + (sector * FLASH_SECTOR_SIZE);
+    memcpy(buff, (const void *)srcAddr, count * FLASH_SECTOR_SIZE);
+
+    return RES_OK;
+}
+
+
+DRESULT disk_write(BYTE pdrv,
+                   const BYTE *buff,
+                   DWORD sector,
+                   UINT count)
+{
+    uint32_t currentByte;
+    uint32_t remainingBytes;
+    uint32_t bufferOffset = 0;
+
+    uint32_t blockOffset;
+    uint32_t offsetInBlock;
+    uint32_t chunkSize;
+    uint32_t blockAddress;
+
+    if (pdrv != 0)
+        return RES_PARERR;
+
+    if (count == 0)
+        return RES_OK;
+
+    if ((sector >= FLASH_SECTOR_COUNT) ||
+        (count > (FLASH_SECTOR_COUNT - sector)))
+        return RES_PARERR;
+
+    currentByte = sector * FLASH_SECTOR_SIZE;
+    remainingBytes = count * FLASH_SECTOR_SIZE;
+
+    while (remainingBytes > 0)
+    {
+        /* Calculate current 16 KB erase block */
+        blockOffset = currentByte &
+                      ~(FLASH_ERASE_BLOCK_SIZE - 1);
+
+        offsetInBlock = currentByte - blockOffset;
+
+        blockAddress = FLASH_FS_BASE_ADDR + blockOffset;
+
+        /* Calculate bytes that fit in this block */
+        chunkSize = FLASH_ERASE_BLOCK_SIZE - offsetInBlock;
+
+        if (chunkSize > remainingBytes)
+        {
+            chunkSize = remainingBytes;
+        }
+
+        /*
+         * STEP 1:
+         * Copy existing flash contents into RAM.
+         * This preserves data outside the requested write.
+         */
+        memcpy(s_blockBuffer,(const void *)blockAddress,FLASH_ERASE_BLOCK_SIZE);
+
+        /*
+         * STEP 2:
+         * Update all requested sectors belonging
+         * to this erase block.
+         */
+        memcpy(((uint8_t *)s_blockBuffer) + offsetInBlock,buff + bufferOffset,chunkSize);
+
+        /*
+         * STEP 3:
+         * Erase the 16 KB hardware block ONCE.
+         */
+        if (FlashErase(blockAddress) != 0)
+        {
+            return RES_ERROR;
+        }
+
+        /*
+         * STEP 4:
+         * Program the complete 16 KB block ONCE.
+         */
+        if (FlashProgram(s_blockBuffer, blockAddress,FLASH_ERASE_BLOCK_SIZE) != 0)
+        {
+            return RES_ERROR;
+        }
+
+        /* Move to next block / remaining data */
+        currentByte += chunkSize;
+        bufferOffset += chunkSize;
+        remainingBytes -= chunkSize;
+    }
+
+    return RES_OK;
+}
+
+DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff)
+{
+    if (pdrv != 0) {
+        return RES_PARERR;
+    }
+
+    switch (cmd) {
+        case CTRL_SYNC:
+            return RES_OK;
+        case GET_SECTOR_COUNT:
+            *(DWORD *)buff = FLASH_SECTOR_COUNT;
+            return RES_OK;
+        case GET_SECTOR_SIZE:
+            *(WORD *)buff = FLASH_SECTOR_SIZE;
+            return RES_OK;
+        case GET_BLOCK_SIZE:
+            *(DWORD *)buff = FLASH_ERASE_BLOCK_SIZE / FLASH_SECTOR_SIZE; /* 32 sectors per block */
+            return RES_OK;
+        default:
+            return RES_PARERR;
+    }
+}
+
+
